@@ -78,7 +78,7 @@ func (peer *Peer) timersActive() bool {
 
 func expiredRetransmitHandshake(peer *Peer) {
 	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
+		peer.device.log.Errorf("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()

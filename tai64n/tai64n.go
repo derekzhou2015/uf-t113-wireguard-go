@@ -32,8 +32,17 @@ func Now() Timestamp {
 	return stamp(time.Now())
 }
 
+// FromTime returns the TAI64N timestamp for an arbitrary wall-clock time.
+func FromTime(t time.Time) Timestamp {
+	return stamp(t)
+}
+
 func (t1 Timestamp) After(t2 Timestamp) bool {
 	return bytes.Compare(t1[:], t2[:]) > 0
+}
+
+func (t1 Timestamp) Before(t2 Timestamp) bool {
+	return bytes.Compare(t1[:], t2[:]) < 0
 }
 
 func (t Timestamp) String() string {

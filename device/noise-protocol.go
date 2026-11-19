@@ -223,13 +223,25 @@ type Handshake struct {
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
+	recentEphemerals          [recentEphemeralsSize]uint64 // ring of truncated initiation ephemeral keys
+	recentEphemeralsCursor    int
 }
+
+// recentEphemeralsSize bounds the per-peer ring of recently accepted
+// initiation ephemeral keys used to reject replays on the clock-rollback
+// recovery path. 256 entries cover far more legitimate handshakes than can
+// occur inside HandshakeTimestampMaxSkew.
+const recentEphemeralsSize = 256
 
 var (
 	InitialChainKey [blake2s.Size]byte
 	InitialHash     [blake2s.Size]byte
 	ZeroNonce       [chacha20poly1305.NonceSize]byte
 )
+
+// tai64nNow generates the timestamp sealed into handshake initiations.
+// It is a variable so tests can simulate a rolled-back clock.
+var tai64nNow = tai64n.Now
 
 func mixKey(dst, c *[blake2s.Size]byte, data []byte) {
 	KDF1(dst, c[:], data)
@@ -254,6 +266,48 @@ func (h *Handshake) Clear() {
 
 func (h *Handshake) mixHash(data []byte) {
 	mixHash(&h.hash, &h.hash, data)
+}
+
+/* hasSeenEphemeral reports whether an initiation carrying this ephemeral key
+ * was accepted recently. h.mutex must be held.
+ */
+func (h *Handshake) hasSeenEphemeral(ephemeral *NoisePublicKey) bool {
+	id := binary.LittleEndian.Uint64(ephemeral[:8])
+	for _, seen := range h.recentEphemerals {
+		if seen == id {
+			return true
+		}
+	}
+	return false
+}
+
+/* rememberEphemeral records an accepted initiation ephemeral key so that a
+ * byte-identical replay of the same initiation stays rejected even on the
+ * clock-rollback recovery path. h.mutex must be held.
+ */
+func (h *Handshake) rememberEphemeral(ephemeral *NoisePublicKey) {
+	h.recentEphemerals[h.recentEphemeralsCursor] = binary.LittleEndian.Uint64(ephemeral[:8])
+	h.recentEphemeralsCursor = (h.recentEphemeralsCursor + 1) % recentEphemeralsSize
+}
+
+/* acceptRolledBackTimestamp reports whether an initiation whose timestamp
+ * failed the strictly-increasing replay check may still be accepted as a
+ * genuine new handshake from a peer whose clock rolled backwards (NTP step,
+ * VM snapshot restore). Such a handshake is indistinguishable from a replay
+ * by its timestamp alone, so it is accepted only when it still claims to be
+ * fresh (within HandshakeTimestampMaxSkew of the local wall clock) and its
+ * ephemeral key was not seen before. A replayed message fails at least one
+ * of the two checks: an old capture falls outside the skew window, and a
+ * recent capture has a recorded ephemeral. h.mutex must be held for writing.
+ */
+func (h *Handshake) acceptRolledBackTimestamp(timestamp *tai64n.Timestamp, ephemeral *NoisePublicKey) bool {
+	now := time.Now()
+	oldest := tai64n.FromTime(now.Add(-HandshakeTimestampMaxSkew))
+	newest := tai64n.FromTime(now.Add(HandshakeTimestampMaxSkew))
+	if timestamp.Before(oldest) || timestamp.After(newest) {
+		return false
+	}
+	return !h.hasSeenEphemeral(ephemeral)
 }
 
 func (h *Handshake) mixKey(data []byte) {
@@ -320,7 +374,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		handshake.chainKey[:],
 		handshake.precomputedStaticStatic[:],
 	)
-	timestamp := tai64n.Now()
+	timestamp := tai64nNow()
 	aead, _ = chacha20poly1305.New(key[:])
 	aead.Seal(msg.Timestamp[:0], ZeroNonce[:], timestamp[:], handshake.hash[:])
 
@@ -404,13 +458,8 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	// protect against replay & flood
 
-	replay := !timestamp.After(handshake.lastTimestamp)
 	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
 	handshake.mutex.RUnlock()
-	if replay {
-		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
-		return nil
-	}
 	if flood {
 		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake flood", peer)
 		return nil
@@ -420,6 +469,23 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	handshake.mutex.Lock()
 
+	/* A timestamp that is not strictly increasing is normally a replay and
+	 * is dropped. The single exception is a peer whose clock rolled
+	 * backwards: its new handshakes carry timestamps behind the recorded
+	 * high-water mark and would be dropped silently until real time catches
+	 * up, tearing down the session without any signal. Accept such a
+	 * handshake only through the recovery check, so genuine replays stay
+	 * rejected and the recorded high-water mark never moves backwards.
+	 */
+	if !timestamp.After(handshake.lastTimestamp) {
+		if !handshake.acceptRolledBackTimestamp(&timestamp, &msg.Ephemeral) {
+			handshake.mutex.Unlock()
+			device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
+			return nil
+		}
+		device.log.Errorf("%v - ConsumeMessageInitiation: peer clock rolled back, accepting new handshake @ %v", peer, timestamp)
+	}
+
 	handshake.hash = hash
 	handshake.chainKey = chainKey
 	handshake.remoteIndex = msg.Sender
@@ -427,6 +493,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	if timestamp.After(handshake.lastTimestamp) {
 		handshake.lastTimestamp = timestamp
 	}
+	handshake.rememberEphemeral(&msg.Ephemeral)
 	now := time.Now()
 	if now.After(handshake.lastInitiationConsumption) {
 		handshake.lastInitiationConsumption = now

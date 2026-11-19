@@ -24,6 +24,15 @@ const (
 	CookieRefreshTime       = time.Second * 120
 	HandshakeInitationRate  = time.Second / 50
 	PaddingMultiple         = 16
+
+	/* A handshake initiation whose timestamp fails the strictly-increasing
+	 * replay check may still be accepted when it claims to have been
+	 * generated within this window of the local wall clock and its ephemeral
+	 * key has not been seen before. This recovers sessions after a peer
+	 * clock rollback (NTP step, VM snapshot restore) without accepting
+	 * genuinely old replayed messages.
+	 */
+	HandshakeTimestampMaxSkew = time.Second * 300
 )
 
 const (
