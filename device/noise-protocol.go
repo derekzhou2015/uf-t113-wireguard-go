@@ -221,8 +221,36 @@ type Handshake struct {
 	remoteEphemeral           NoisePublicKey           // ephemeral public key
 	precomputedStaticStatic   [NoisePublicKeySize]byte // precomputed shared secret
 	lastTimestamp             tai64n.Timestamp
+	recentTimestamps          [handshakeReplayCacheSize]tai64n.Timestamp // ring of consumed initiation timestamps
+	recentTimestampsAt        int
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
+}
+
+/* Number of initiation timestamps remembered per peer for replay
+ * detection. A replayed initiation carries the exact timestamp of an
+ * already consumed one; a fresh initiation created after the peer's
+ * clock stepped backward carries a regressed but new timestamp and
+ * must still be accepted, or the tunnel silently wedges until the
+ * peer's clock catches up with the previously recorded timestamp.
+ */
+const handshakeReplayCacheSize = 16
+
+// seenTimestamp reports whether ts belongs to a recently consumed
+// initiation, i.e. the message at hand is an exact replay.
+func (h *Handshake) seenTimestamp(ts tai64n.Timestamp) bool {
+	for i := range h.recentTimestamps {
+		if h.recentTimestamps[i] == ts {
+			return true
+		}
+	}
+	return false
+}
+
+// rememberTimestamp records ts as consumed for replay detection.
+func (h *Handshake) rememberTimestamp(ts tai64n.Timestamp) {
+	h.recentTimestamps[h.recentTimestampsAt] = ts
+	h.recentTimestampsAt = (h.recentTimestampsAt + 1) % handshakeReplayCacheSize
 }
 
 var (
@@ -404,7 +432,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	// protect against replay & flood
 
-	replay := !timestamp.After(handshake.lastTimestamp)
+	replay := handshake.seenTimestamp(timestamp)
 	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
 	handshake.mutex.RUnlock()
 	if replay {
@@ -420,10 +448,24 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	handshake.mutex.Lock()
 
+	if !timestamp.After(handshake.lastTimestamp) {
+		/* The timestamp moved backwards even though the initiation
+		 * authenticated correctly. This happens when the peer's clock
+		 * stepped backward (NTP step, VM snapshot rollback). Dropping
+		 * it would wedge the tunnel until the peer's clock catches up:
+		 * the initiator would retry until its attempt budget is
+		 * exhausted and then flush its staged packets. The initiation
+		 * is authenticated and is not an exact replay (checked above),
+		 * so accept it.
+		 */
+		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake timestamp regressed (%v not after %v), peer clock may have stepped backward; accepting", peer, timestamp, handshake.lastTimestamp)
+	}
+
 	handshake.hash = hash
 	handshake.chainKey = chainKey
 	handshake.remoteIndex = msg.Sender
 	handshake.remoteEphemeral = msg.Ephemeral
+	handshake.rememberTimestamp(timestamp)
 	if timestamp.After(handshake.lastTimestamp) {
 		handshake.lastTimestamp = timestamp
 	}
